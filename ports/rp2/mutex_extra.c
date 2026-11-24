@@ -20,7 +20,10 @@ uint32_t __time_critical_func(recursive_mutex_enter_blocking_and_disable_interru
             assert(total); // check for overflow
             return save;
         }
-        lock_internal_spin_unlock_with_wait(&mtx->core, save);
+        // Spin rather than WFE, so that the exit below needn't SEV (which
+        // would wake mp_wfe_or_timeout() in select.poll's wait).
+        spin_unlock(mtx->core.spin_lock, save);
+        tight_loop_contents();
     } while (true);
 }
 
@@ -31,7 +34,8 @@ void __time_critical_func(recursive_mutex_exit_and_restore_interrupts)(recursive
     if (!--mtx->enter_count) {
         mtx->owner = LOCK_INVALID_OWNER_ID;
     }
-    lock_internal_spin_unlock_with_notify(&mtx->core, save);
+    // No SEV: a waiter in the enter above spins rather than WFEs.
+    spin_unlock(mtx->core.spin_lock, save);
 }
 
 void __time_critical_func(recursive_mutex_nowait_enter_blocking)(recursive_mutex_nowait_t * mtx) {
