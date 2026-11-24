@@ -1345,6 +1345,9 @@ pending_exception_check:
                 // occur every few instructions.
                 MICROPY_VM_HOOK_LOOP
 
+                // Without a GIL: stop here if another thread wants to GC.
+                MP_THREAD_GC_SAFEPOINT();
+
                 // Check for pending exceptions or scheduled tasks to run.
                 // Note: it's safe to just call mp_handle_pending(...), but
                 // we can inline the check for the common case where there is

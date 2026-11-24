@@ -61,8 +61,20 @@ void mp_thread_recursive_mutex_unlock(mp_thread_recursive_mutex_t *mutex);
 #define MP_THREAD_GIL_ENTER() mp_thread_mutex_lock(&MP_STATE_VM(gil_mutex), 1)
 #define MP_THREAD_GIL_EXIT() mp_thread_mutex_unlock(&MP_STATE_VM(gil_mutex))
 #else
+// Without a GIL a port may still define these: they mark where a thread stops
+// touching the heap (EXIT) and starts again (ENTER), which is what a
+// stop-the-world GC needs to know.
+#ifndef MP_THREAD_GIL_ENTER
 #define MP_THREAD_GIL_ENTER()
+#endif
+#ifndef MP_THREAD_GIL_EXIT
 #define MP_THREAD_GIL_EXIT()
+#endif
+#endif
+
+// A point where a running thread may be stopped for a GC (no-GIL ports).
+#ifndef MP_THREAD_GC_SAFEPOINT
+#define MP_THREAD_GC_SAFEPOINT()
 #endif
 
 #endif // MICROPY_INCLUDED_PY_MPTHREAD_H

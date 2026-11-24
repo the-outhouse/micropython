@@ -272,6 +272,31 @@ static mp_obj_t esp32_idf_heap_info(const mp_obj_t cap_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_idf_heap_info_obj, esp32_idf_heap_info);
 
+#if MICROPY_PY_THREAD && !MICROPY_PY_THREAD_GIL
+// gc_stop_stats([reset]) -> per core that started the collection:
+// ((n, wait_over_10ms, wait_max_us, wait_sum_us, stop_max_us, stop_sum_us), ...)
+// wait = until every other thread was at a safepoint; stop = until resumed.
+static mp_obj_t esp32_gc_stop_stats(size_t n_args, const mp_obj_t *args) {
+    mp_obj_t cores[2];
+    mp_thread_gc_stop_stats_t snap[2];
+    mp_thread_gc_stop_stats_read(snap, n_args > 0 && mp_obj_is_true(args[0]));
+    for (int i = 0; i < 2; i++) {
+        mp_thread_gc_stop_stats_t *st = &snap[i];
+        mp_obj_t t[6] = {
+            mp_obj_new_int_from_uint(st->n),
+            mp_obj_new_int_from_uint(st->wait_over_10ms),
+            mp_obj_new_int_from_uint(st->wait_max_us),
+            mp_obj_new_int_from_ull(st->wait_sum_us),
+            mp_obj_new_int_from_uint(st->stop_max_us),
+            mp_obj_new_int_from_ull(st->stop_sum_us),
+        };
+        cores[i] = mp_obj_new_tuple(6, t);
+    }
+    return mp_obj_new_tuple(2, cores);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(esp32_gc_stop_stats_obj, 0, 1, esp32_gc_stop_stats);
+#endif
+
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY
 static mp_obj_t esp32_idf_task_info(void) {
     const size_t task_count_max = uxTaskGetNumberOfTasks();
@@ -340,6 +365,9 @@ static const mp_rom_map_elem_t esp32_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_mcu_temperature), MP_ROM_PTR(&esp32_mcu_temperature_obj) },
     #endif
     { MP_ROM_QSTR(MP_QSTR_idf_heap_info), MP_ROM_PTR(&esp32_idf_heap_info_obj) },
+    #if MICROPY_PY_THREAD && !MICROPY_PY_THREAD_GIL
+    { MP_ROM_QSTR(MP_QSTR_gc_stop_stats), MP_ROM_PTR(&esp32_gc_stop_stats_obj) },
+    #endif
     #if CONFIG_FREERTOS_USE_TRACE_FACILITY
     { MP_ROM_QSTR(MP_QSTR_idf_task_info), MP_ROM_PTR(&esp32_idf_task_info_obj) },
     #endif

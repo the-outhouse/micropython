@@ -172,6 +172,11 @@ static inline void mp_thread_init_state(mp_state_thread_t *ts, size_t stack_size
     // GC starts off unlocked
     ts->gc_lock_depth = 0;
 
+    #if MICROPY_PY_THREAD && !MICROPY_PY_THREAD_GIL
+    // Not registered for GC stops until the port's mp_thread_start().
+    ts->gc_stop_state = NULL;
+    #endif
+
     // There are no pending jump callbacks or exceptions yet
     ts->nlr_top = NULL;
     ts->nlr_jump_callback_top = NULL;
