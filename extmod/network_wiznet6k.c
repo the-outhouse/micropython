@@ -76,6 +76,32 @@
 #include "lib/wiznet6k/Ethernet/socket.h"
 #include "lib/wiznet6k/Internet/DNS/dns.h"
 #include "lib/wiznet6k/Internet/DHCP/dhcp.h"
+#include "shared/runtime/softtimer.h"
+
+// How often a poll() waiting on a TOE socket wakes to re-read the chip. The
+// chip doesn't interrupt in TOE mode, so without this poll() only notices a
+// socket event when its own timeout runs out.
+#ifndef WIZNET6K_POLL_MS
+#define WIZNET6K_POLL_MS (2)
+#endif
+
+// A listening socket keeps up to this many chip sockets listening on its
+// port (its backlog), so connects that arrive together aren't refused.
+#ifndef WIZNET6K_MAX_LISTEN
+#define WIZNET6K_MAX_LISTEN (4)
+#endif
+
+// Listening sockets don't own a chip socket: their fileno is
+// WIZNET6K_SERVER_FD + an index into wiznet6k_obj.server[].
+#define WIZNET6K_MAX_SERVERS (4)
+#define WIZNET6K_SERVER_FD (64)
+
+typedef struct _wiznet6k_server_t {
+    bool used;
+    uint8_t target;         // chip sockets to keep listening
+    uint16_t port;
+    mp_uint_t timeout_ms;
+} wiznet6k_server_t;
 
 #endif
 
@@ -163,8 +189,11 @@ typedef struct _wiznet6k_obj_t {
     #else // WIZNET6K_PROVIDED_STACK
     wiz_NetInfo netinfo;
     uint8_t socket_used;
+    uint8_t closing;        // chip sockets that sent a FIN and wait for SOCK_CLOSED
     bool active;
     mp_uint_t socket_timeout_ms[_WIZCHIP_SOCK_NUM_];
+    uint8_t listen_owner[_WIZCHIP_SOCK_NUM_];   // 1 + server index for a listening chip socket, else 0
+    wiznet6k_server_t server[WIZNET6K_MAX_SERVERS];
     #endif
 } wiznet6k_obj_t;
 
@@ -497,6 +526,137 @@ void wiznet6k_poll(void) {
 
 #if WIZNET6K_PROVIDED_STACK
 
+static soft_timer_entry_t wiznet6k_wake_timer;
+static bool wiznet6k_wake_ready;
+static volatile bool wiznet6k_wake_armed;
+
+static void wiznet6k_wake_cb(soft_timer_entry_t *self) {
+    (void)self;
+    // Nothing else to do: the timer's interrupt ends the wait in poll(), which
+    // then reads every registered socket's state again.
+    wiznet6k_wake_armed = false;
+}
+
+// Called from each poll of a socket, so poll() wakes within WIZNET6K_POLL_MS.
+static void wiznet6k_arm_wake(void) {
+    if (!wiznet6k_wake_ready) {
+        // Once per boot: a static timer survives soft resets and keeps firing.
+        soft_timer_static_init(&wiznet6k_wake_timer, SOFT_TIMER_MODE_ONE_SHOT, 0, wiznet6k_wake_cb);
+        wiznet6k_wake_ready = true;
+    }
+    if (!wiznet6k_wake_armed) {
+        wiznet6k_wake_armed = true;
+        soft_timer_insert(&wiznet6k_wake_timer, WIZNET6K_POLL_MS);
+    }
+}
+
+// Each socket's poll result is read from the chip at most once a millisecond.
+// Every chip access takes MicroPython's atomic section, which on RP2350 with
+// core 1 running is a mutex whose software spinlock sets the CPU event flag.
+// So without this, poll() never sleeps: its WFE returns at once and it spins
+// re-reading the chip. Index: chip socket, or _WIZCHIP_SOCK_NUM_ + server.
+#define WIZ_POLL_SLOTS (_WIZCHIP_SOCK_NUM_ + WIZNET6K_MAX_SERVERS)
+static uint32_t wiz_poll_ms[WIZ_POLL_SLOTS];
+static uint8_t wiz_poll_ret[WIZ_POLL_SLOTS];
+static uint8_t wiz_poll_valid[(WIZ_POLL_SLOTS + 7) / 8];
+
+static void wiz_poll_forget(int slot) {
+    wiz_poll_valid[slot / 8] &= ~(1 << (slot % 8));
+}
+
+static inline bool wiz_is_chip_sock(mp_int_t fd) {
+    return fd >= 0 && fd < _WIZCHIP_SOCK_NUM_;
+}
+
+static inline bool wiz_is_server(mp_int_t fd) {
+    return fd >= WIZNET6K_SERVER_FD && fd < WIZNET6K_SERVER_FD + WIZNET6K_MAX_SERVERS;
+}
+
+static void wiz_release(uint8_t sn) {
+    wiz_poll_forget(sn);
+    wiznet6k_obj.socket_used &= ~(1 << sn);
+    wiznet6k_obj.closing &= ~(1 << sn);
+    wiznet6k_obj.listen_owner[sn] = 0;
+}
+
+static int wiz_server_members(int i) {
+    int n = 0;
+    for (uint8_t sn = 0; sn < _WIZCHIP_SOCK_NUM_; sn++) {
+        n += wiznet6k_obj.listen_owner[sn] == i + 1;
+    }
+    return n;
+}
+
+// Free the chip sockets whose FIN handshake has finished.
+static void wiz_reap(void) {
+    for (uint8_t sn = 0; sn < _WIZCHIP_SOCK_NUM_; sn++) {
+        if ((wiznet6k_obj.closing & (1 << sn)) && getSn_SR(sn) == SOCK_CLOSED) {
+            wizchip_close(sn);
+            wiz_release(sn);
+        }
+    }
+}
+
+static int wiz_free_sock(void) {
+    for (uint8_t sn = 0; sn < _WIZCHIP_SOCK_NUM_; sn++) {
+        if ((wiznet6k_obj.socket_used & (1 << sn)) == 0) {
+            return sn;
+        }
+    }
+    return -1;
+}
+
+// Claim a chip socket. If none is free, take back a spare listener (one still
+// in SOCK_LISTEN, from a server with others), then a socket still closing.
+static int wiz_alloc(void) {
+    wiz_reap();
+    int sn = wiz_free_sock();
+    for (uint8_t k = 0; sn < 0 && k < _WIZCHIP_SOCK_NUM_; k++) {
+        uint8_t owner = wiznet6k_obj.listen_owner[k];
+        if (owner && getSn_SR(k) == SOCK_LISTEN && wiz_server_members(owner - 1) > 1) {
+            wizchip_close(k);
+            wiz_release(k);
+            sn = k;
+        }
+    }
+    for (uint8_t k = 0; sn < 0 && k < _WIZCHIP_SOCK_NUM_; k++) {
+        if (wiznet6k_obj.closing & (1 << k)) {
+            wizchip_close(k);
+            wiz_release(k);
+            sn = k;
+        }
+    }
+    if (sn >= 0) {
+        wiznet6k_obj.socket_used |= 1 << sn;
+        wiznet6k_obj.socket_timeout_ms[sn] = WIZNET6K_TIMEOUT_BLOCKING;
+    }
+    return sn;
+}
+
+// Keep each server's chip sockets listening up to its backlog, using free
+// sockets only.
+static void wiz_topup(void) {
+    wiz_reap();
+    for (int i = 0; i < WIZNET6K_MAX_SERVERS; i++) {
+        wiznet6k_server_t *srv = &wiznet6k_obj.server[i];
+        if (!srv->used) {
+            continue;
+        }
+        for (int n = wiz_server_members(i); n < srv->target; n++) {
+            int sn = wiz_free_sock();
+            if (sn < 0) {
+                return;
+            }
+            if (wizchip_socket(sn, Sn_MR_TCP, srv->port, 0) < 0 || wizchip_listen(sn) != SOCK_OK) {
+                wizchip_close(sn);
+                return;
+            }
+            wiznet6k_obj.socket_used |= 1 << sn;
+            wiznet6k_obj.listen_owner[sn] = i + 1;
+        }
+    }
+}
+
 static void wiz_dhcp_assign(void) {
     getIPfromDHCP(wiznet6k_obj.netinfo.ip);
     getGWfromDHCP(wiznet6k_obj.netinfo.gw);
@@ -556,13 +716,19 @@ static void wiznet6k_init(void) {
 
 static int wiznet6k_gethostbyname(mp_obj_t nic, const char *name, mp_uint_t len, uint8_t *out_ip) {
     uint8_t dns_ip[MOD_NETWORK_IPADDR_BUF_SIZE] = {8, 8, 8, 8};
+    int sn = wiz_alloc();
+    if (sn < 0) {
+        return -2;
+    }
     uint8_t *buf = m_new(uint8_t, MAX_DNS_BUF_SIZE);
-    DNS_init(2, buf);
+    DNS_init(sn, buf);
     if (wiznet6k_obj.netinfo.dns[0]) {
         memcpy(dns_ip, wiznet6k_obj.netinfo.dns, MOD_NETWORK_IPADDR_BUF_SIZE);
     }
     mp_int_t ret = DNS_run(dns_ip, (uint8_t *)name, out_ip);
     m_del(uint8_t, buf, MAX_DNS_BUF_SIZE);
+    wizchip_close(sn);
+    wiz_release(sn);
     if (ret == 1) {
         // success
         return 0;
@@ -591,15 +757,7 @@ static int wiznet6k_socket_socket(mod_network_socket_obj_t *socket, int *_errno)
     }
 
     if (socket->fileno == -1) {
-        // get first unused socket number
-        for (mp_uint_t sn = 0; sn < _WIZCHIP_SOCK_NUM_; sn++) {
-            if ((wiznet6k_obj.socket_used & (1 << sn)) == 0) {
-                wiznet6k_obj.socket_used |= (1 << sn);
-                socket->fileno = sn;
-                wiznet6k_obj.socket_timeout_ms[sn] = WIZNET6K_TIMEOUT_BLOCKING;
-                break;
-            }
-        }
+        socket->fileno = wiz_alloc();
         if (socket->fileno == -1) {
             // too many open sockets
             *_errno = MP_EMFILE;
@@ -618,11 +776,39 @@ static int wiznet6k_socket_socket(mod_network_socket_obj_t *socket, int *_errno)
 }
 
 static void wiznet6k_socket_close(mod_network_socket_obj_t *socket) {
-    uint8_t sn = (uint8_t)socket->fileno;
-    if (sn < _WIZCHIP_SOCK_NUM_) {
-        wiznet6k_obj.socket_used &= ~(1 << sn);
-        wizchip_close(sn);
+    mp_int_t fd = socket->fileno;
+    if (wiz_is_server(fd)) {
+        int i = fd - WIZNET6K_SERVER_FD;
+        for (uint8_t sn = 0; sn < _WIZCHIP_SOCK_NUM_; sn++) {
+            if (wiznet6k_obj.listen_owner[sn] == i + 1) {
+                wizchip_close(sn);
+                wiz_release(sn);
+            }
+        }
+        wiznet6k_obj.server[i].used = false;
+        wiz_poll_forget(_WIZCHIP_SOCK_NUM_ + i);
+    } else if (wiz_is_chip_sock(fd)) {
+        uint8_t sn = fd;
+        wiz_poll_forget(sn);
+        uint8_t sr = getSn_SR(sn);
+        if (sr == SOCK_ESTABLISHED || sr == SOCK_CLOSE_WAIT) {
+            // Send a FIN, so the peer sees the end of the stream. The chip
+            // finishes the handshake itself; the socket is freed once it
+            // reaches SOCK_CLOSED (wiz_reap), or taken back if one is needed.
+            setSn_CR(sn, Sn_CR_DISCON);
+            while (getSn_CR(sn)) {
+            }
+            wiznet6k_obj.closing |= 1 << sn;
+            wiznet6k_obj.listen_owner[sn] = 0;
+        } else {
+            wizchip_close(sn);
+            wiz_release(sn);
+        }
     }
+    // Forget the number: the chip socket may be reused by another socket, and
+    // this object may still be closed again (or polled) later.
+    socket->fileno = -1;
+    wiz_topup();
 }
 
 static int wiznet6k_socket_bind(mod_network_socket_obj_t *socket, byte *ip, mp_uint_t port, int *_errno) {
@@ -642,77 +828,87 @@ static int wiznet6k_socket_bind(mod_network_socket_obj_t *socket, byte *ip, mp_u
 }
 
 static int wiznet6k_socket_listen(mod_network_socket_obj_t *socket, mp_int_t backlog, int *_errno) {
-    mp_int_t ret = wizchip_listen(socket->fileno);
+    if (!wiz_is_chip_sock(socket->fileno)) {
+        *_errno = MP_EBADF;
+        return -1;
+    }
+    int i = 0;
+    while (i < WIZNET6K_MAX_SERVERS && wiznet6k_obj.server[i].used) {
+        i++;
+    }
+    if (i == WIZNET6K_MAX_SERVERS) {
+        *_errno = MP_EMFILE;
+        return -1;
+    }
+    uint8_t sn = socket->fileno;
+    mp_int_t ret = wizchip_listen(sn);
     if (ret < 0) {
         wiznet6k_socket_close(socket);
         *_errno = -ret;
         return -1;
     }
+    wiznet6k_server_t *srv = &wiznet6k_obj.server[i];
+    srv->used = true;
+    srv->target = backlog < 1 ? 1 : backlog > WIZNET6K_MAX_LISTEN ? WIZNET6K_MAX_LISTEN : backlog;
+    #if _WIZCHIP_ == W6100 || _WIZCHIP_ == W6300
+    srv->port = getSn_PORTR(sn);
+    #else
+    srv->port = getSn_PORT(sn);
+    #endif
+    srv->timeout_ms = wiznet6k_obj.socket_timeout_ms[sn];
+    wiznet6k_obj.listen_owner[sn] = i + 1;
+    socket->fileno = WIZNET6K_SERVER_FD + i;
+    wiz_topup();
     return 0;
 }
 
 static int wiznet6k_socket_accept(mod_network_socket_obj_t *socket, mod_network_socket_obj_t *socket2, byte *ip, mp_uint_t *port, int *_errno) {
-    // Read timeout setting for this socket
-    mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
-    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
-        timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
+    if (!wiz_is_server(socket->fileno)) {
+        *_errno = MP_EINVAL;
+        return -1;
     }
-
+    int i = socket->fileno - WIZNET6K_SERVER_FD;
+    mp_uint_t timeout_ms = wiznet6k_obj.server[i].timeout_ms;
     mp_uint_t start = mp_hal_ticks_ms();
 
     for (;;) {
-        uint8_t sn = (uint8_t)socket->fileno;
-        int sr = getSn_SR(sn);
-
-        if (sr == SOCK_ESTABLISHED) {
-            socket2->domain = socket->domain;
-            socket2->type = socket->type;
-            socket2->fileno = socket->fileno;
-            getSn_DIPR((uint8_t)socket2->fileno, ip);
-            #if _WIZCHIP_ == W6100 || _WIZCHIP_ == W6300
-            *port = getSn_PORTR(socket2->fileno);
-            #else
-            *port = getSn_PORT(socket2->fileno);
-            #endif
-
-            // WIZnet turns the listening socket into the client socket, so we
-            // need to re-bind and re-listen on another socket for the server.
-            // TODO handle errors, especially no-more-sockets error
-            socket->domain = MOD_NETWORK_AF_INET;
-            socket->fileno = -1;
-            int _errno2;
-            if (wiznet6k_socket_socket(socket, &_errno2) != 0) {
-                // printf("(bad resocket %d)\n", _errno2);
-            } else if (wiznet6k_socket_bind(socket, NULL, *port, &_errno2) != 0) {
-                // printf("(bad rebind %d)\n", _errno2);
-            } else if (wiznet6k_socket_listen(socket, 0, &_errno2) != 0) {
-                // printf("(bad relisten %d)\n", _errno2);
+        for (uint8_t sn = 0; sn < _WIZCHIP_SOCK_NUM_; sn++) {
+            if (wiznet6k_obj.listen_owner[sn] != i + 1) {
+                continue;
             }
-
-            return 0;
+            uint8_t sr = getSn_SR(sn);
+            if (sr == SOCK_ESTABLISHED || sr == SOCK_CLOSE_WAIT) {
+                // A connection (CLOSE_WAIT: one that already sent its data
+                // and closed). Hand the chip socket over; the server keeps
+                // its other listeners and gets a new one if a socket is free.
+                wiznet6k_obj.listen_owner[sn] = 0;
+                wiz_poll_forget(sn);
+                wiz_poll_forget(_WIZCHIP_SOCK_NUM_ + i);
+                wiznet6k_obj.socket_timeout_ms[sn] = WIZNET6K_TIMEOUT_BLOCKING;
+                socket2->domain = socket->domain;
+                socket2->type = socket->type;
+                socket2->fileno = sn;
+                getSn_DIPR(sn, ip);
+                *port = getSn_DPORT(sn);
+                wiz_topup();
+                return 0;
+            }
+            if (sr == SOCK_CLOSED) {
+                // A listener that dropped (eg a connect reset mid-handshake).
+                wizchip_close(sn);
+                wiz_release(sn);
+            }
         }
+        wiz_topup();
 
-        // Listening socket closed unexpectedly
-        if (sr == SOCK_CLOSED || sr == SOCK_CLOSE_WAIT) {
-            wiznet6k_socket_close(socket);
-            *_errno = MP_ENOTCONN;
-            return -1;
-        }
-
-        // Non-blocking: return immediately
         if (timeout_ms == 0) {
             *_errno = MP_EAGAIN;
             return -1;
         }
-
-        // Software timeout check
-        if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING) {
-            if (mp_hal_ticks_ms() - start >= timeout_ms) {
-                *_errno = MP_ETIMEDOUT;
-                return -1;
-            }
+        if (timeout_ms != WIZNET6K_TIMEOUT_BLOCKING && mp_hal_ticks_ms() - start >= timeout_ms) {
+            *_errno = MP_ETIMEDOUT;
+            return -1;
         }
-
         mp_hal_delay_ms(1);
     }
 }
@@ -739,6 +935,10 @@ static int wiznet6k_socket_connect(mod_network_socket_obj_t *socket, byte *ip, m
 }
 
 static mp_uint_t wiznet6k_socket_send(mod_network_socket_obj_t *socket, const byte *buf, mp_uint_t len, int *_errno) {
+    if (!wiz_is_chip_sock(socket->fileno)) {
+        *_errno = MP_ENOTCONN;
+        return -1;
+    }
     mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
     if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
         timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
@@ -762,7 +962,7 @@ static mp_uint_t wiznet6k_socket_send(mod_network_socket_obj_t *socket, const by
         uint8_t sr = getSn_SR(sn);
 
         if (sr == SOCK_CLOSED || sr == SOCK_CLOSE_WAIT) {
-            wiznet6k_socket_close(socket);
+            // Leave the socket to close(), which sends the FIN.
             *_errno = MP_ENOTCONN;
             return -1;
         }
@@ -782,6 +982,7 @@ static mp_uint_t wiznet6k_socket_send(mod_network_socket_obj_t *socket, const by
         mp_hal_delay_ms(1);
     }
 
+    wiz_poll_forget(sn);
     MP_THREAD_GIL_EXIT();
     mp_int_t ret = wizchip_send(sn, (byte *)buf, len);
     MP_THREAD_GIL_ENTER();
@@ -795,6 +996,9 @@ static mp_uint_t wiznet6k_socket_send(mod_network_socket_obj_t *socket, const by
 }
 
 static mp_uint_t wiznet6k_socket_recv(mod_network_socket_obj_t *socket, byte *buf, mp_uint_t len, int *_errno) {
+    if (!wiz_is_chip_sock(socket->fileno)) {
+        return 0;   // closed: end of stream
+    }
     mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
     if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
         timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
@@ -808,12 +1012,13 @@ static mp_uint_t wiznet6k_socket_recv(mod_network_socket_obj_t *socket, byte *bu
         uint16_t rx_size = getSn_RX_RSR(sn);
 
         if ((sr == SOCK_CLOSED || sr == SOCK_CLOSE_WAIT) && rx_size == 0) {
-            wiznet6k_socket_close(socket);
+            // End of stream. Leave the socket to close(), which sends the FIN.
             *_errno = 0;
             return 0;
         }
 
         if (rx_size > 0) {
+            wiz_poll_forget(sn);
             MP_THREAD_GIL_EXIT();
             mp_int_t ret = wizchip_recv(sn, buf, len);
             MP_THREAD_GIL_ENTER();
@@ -868,6 +1073,10 @@ static mp_uint_t wiznet6k_socket_recv(mod_network_socket_obj_t *socket, byte *bu
 }
 
 static mp_uint_t wiznet6k_socket_sendto(mod_network_socket_obj_t *socket, const byte *buf, mp_uint_t len, byte *ip, mp_uint_t port, int *_errno) {
+    if (!wiz_is_chip_sock(socket->fileno)) {
+        *_errno = MP_EBADF;
+        return -1;
+    }
     if (socket->domain == 0) {
         if (wiznet6k_socket_bind(socket, ip, 0, _errno) != 0) {
             return -1;
@@ -918,6 +1127,10 @@ static mp_uint_t wiznet6k_socket_sendto(mod_network_socket_obj_t *socket, const 
 }
 
 static mp_uint_t wiznet6k_socket_recvfrom(mod_network_socket_obj_t *socket, byte *buf, mp_uint_t len, byte *ip, mp_uint_t *port, int *_errno) {
+    if (!wiz_is_chip_sock(socket->fileno)) {
+        *_errno = MP_EBADF;
+        return -1;
+    }
     mp_uint_t timeout_ms = WIZNET6K_TIMEOUT_BLOCKING;
     if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
         timeout_ms = wiznet6k_obj.socket_timeout_ms[socket->fileno];
@@ -986,6 +1199,10 @@ static int wiznet6k_socket_setsockopt(mod_network_socket_obj_t *socket, mp_uint_
                     return -1;
                 }
                 int enable = *(const int *)optval;
+                if (!wiz_is_chip_sock(socket->fileno)) {
+                    *_errno = MP_EBADF;
+                    return -1;
+                }
                 // Sn_KPALVTR: 0 = disabled, non-zero = interval in 5s units
                 // Set to WIZNET6K_KEEPALIVE_INTVL (10s interval) when enabled
                 setSn_KPALVTR(sn, enable ? WIZNET6K_KEEPALIVE_INTVL : 0);
@@ -998,7 +1215,11 @@ static int wiznet6k_socket_setsockopt(mod_network_socket_obj_t *socket, mp_uint_
                 if (wiznet6k_parse_timeout_ms(optval, optlen, &timeout_ms, _errno) != 0) {
                     return -1;
                 }
-                wiznet6k_obj.socket_timeout_ms[sn] = timeout_ms;
+                if (wiz_is_chip_sock(socket->fileno)) {
+                    wiznet6k_obj.socket_timeout_ms[sn] = timeout_ms;
+                } else if (wiz_is_server(socket->fileno)) {
+                    wiznet6k_obj.server[socket->fileno - WIZNET6K_SERVER_FD].timeout_ms = timeout_ms;
+                }
                 socket->timeout = timeout_ms;
                 return 0;
             }
@@ -1019,8 +1240,10 @@ static int wiznet6k_socket_settimeout(mod_network_socket_obj_t *socket, mp_uint_
     socket->timeout = timeout_ms;
 
     // Save timeout setting even before the underlying WIZnet socket is opened.
-    if (socket->fileno >= 0 && (mp_uint_t)socket->fileno < _WIZCHIP_SOCK_NUM_) {
+    if (wiz_is_chip_sock(socket->fileno)) {
         wiznet6k_obj.socket_timeout_ms[socket->fileno] = timeout_ms;
+    } else if (wiz_is_server(socket->fileno)) {
+        wiznet6k_obj.server[socket->fileno - WIZNET6K_SERVER_FD].timeout_ms = timeout_ms;
     }
 
     return 0;
@@ -1029,13 +1252,54 @@ static int wiznet6k_socket_settimeout(mod_network_socket_obj_t *socket, mp_uint_
 static int wiznet6k_socket_ioctl(mod_network_socket_obj_t *socket, mp_uint_t request, mp_uint_t arg, int *_errno) {
     if (request == MP_STREAM_POLL) {
         int ret = 0;
-        if (arg & MP_STREAM_POLL_RD && getSn_RX_RSR(socket->fileno) != 0) {
-            ret |= MP_STREAM_POLL_RD;
+        mp_int_t fd = socket->fileno;
+        wiznet6k_arm_wake();
+        int slot;
+        if (wiz_is_server(fd)) {
+            slot = _WIZCHIP_SOCK_NUM_ + fd - WIZNET6K_SERVER_FD;
+        } else if (wiz_is_chip_sock(fd)) {
+            slot = fd;
+        } else {
+            // Closed: reads give end of stream, writes an error.
+            return (arg & (MP_STREAM_POLL_RD | MP_STREAM_POLL_WR)) | MP_STREAM_POLL_HUP;
         }
-        if (arg & MP_STREAM_POLL_WR && getSn_TX_FSR(socket->fileno) != 0) {
-            ret |= MP_STREAM_POLL_WR;
+        uint32_t now = mp_hal_ticks_ms();
+        if ((wiz_poll_valid[slot / 8] & (1 << (slot % 8))) && wiz_poll_ms[slot] == now) {
+            return wiz_poll_ret[slot] & (arg | MP_STREAM_POLL_HUP);
         }
-        return ret;
+        if (wiz_is_server(fd)) {
+            // Readable when a connection is waiting for accept().
+            int i = fd - WIZNET6K_SERVER_FD;
+            for (uint8_t sn = 0; sn < _WIZCHIP_SOCK_NUM_; sn++) {
+                if (wiznet6k_obj.listen_owner[sn] == i + 1) {
+                    uint8_t sr = getSn_SR(sn);
+                    if (sr == SOCK_ESTABLISHED || sr == SOCK_CLOSE_WAIT) {
+                        ret |= MP_STREAM_POLL_RD;
+                        break;
+                    }
+                }
+            }
+        } else {
+            uint8_t sn = fd;
+            uint8_t sr = getSn_SR(sn);
+            // The peer closed (CLOSE_WAIT) or reset (CLOSED): a read returns
+            // end of stream, so report readable even with nothing to read.
+            bool opened = socket->domain == 1;
+            bool gone = sr == SOCK_CLOSE_WAIT || (sr == SOCK_CLOSED && opened);
+            if (gone || getSn_RX_RSR(sn) != 0) {
+                ret |= MP_STREAM_POLL_RD;
+            }
+            if (gone || getSn_TX_FSR(sn) != 0) {
+                ret |= MP_STREAM_POLL_WR;
+            }
+            if (sr == SOCK_CLOSED && opened) {
+                ret |= MP_STREAM_POLL_HUP;
+            }
+        }
+        wiz_poll_ms[slot] = now;
+        wiz_poll_ret[slot] = ret;
+        wiz_poll_valid[slot / 8] |= 1 << (slot % 8);
+        return ret & (arg | MP_STREAM_POLL_HUP);
     } else {
         *_errno = MP_EINVAL;
         return MP_STREAM_ERROR;
@@ -1046,12 +1310,17 @@ static void wiznet6k_dhcp_init(wiznet6k_obj_t *self) {
     uint8_t test_buf[2048];
     uint8_t ret = 0;
     uint8_t dhcp_retry = 0;
+    // A claimed chip socket, not a fixed number that may be in use.
+    int sn = wiz_alloc();
+    if (sn < 0) {
+        mp_raise_OSError(MP_EMFILE);
+    }
 
     while (ret != DHCP_IP_LEASED) {
         mp_uint_t now = mp_hal_ticks_ms();
         mp_uint_t timeout = now + 3000;
         mp_uint_t next_tick = now + 1000;
-        DHCP_init(1, test_buf);
+        DHCP_init(sn, test_buf);
 
         while (1) {
             ret = DHCP_run();
@@ -1072,11 +1341,15 @@ static void wiznet6k_dhcp_init(wiznet6k_obj_t *self) {
         }
 
         if (dhcp_retry > 3) {
+            wizchip_close(sn);
+            wiz_release(sn);
             mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("timeout waiting for DHCP to get IP address"));
             break;
         }
     }
 
+    wizchip_close(sn);
+    wiz_release(sn);
     if (ret == DHCP_IP_LEASED) {
         ctlnetwork(CN_GET_NETINFO, &self->netinfo);
     }
@@ -1162,8 +1435,13 @@ static mp_obj_t wiznet6k_make_new(const mp_obj_type_t *type, size_t n_args, size
     #else // WIZNET6K_PROVIDED_STACK
     wiznet6k_obj.active = false;
     wiznet6k_obj.socket_used = 0;
+    wiznet6k_obj.closing = 0;
     for (mp_uint_t i = 0; i < _WIZCHIP_SOCK_NUM_; ++i) {
         wiznet6k_obj.socket_timeout_ms[i] = WIZNET6K_TIMEOUT_BLOCKING;
+        wiznet6k_obj.listen_owner[i] = 0;
+    }
+    for (mp_uint_t i = 0; i < WIZNET6K_MAX_SERVERS; ++i) {
+        wiznet6k_obj.server[i].used = false;
     }
     #endif
 
