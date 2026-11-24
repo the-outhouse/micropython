@@ -485,6 +485,7 @@ static void gc_collect_start_common(void) {
     assert((MP_STATE_THREAD(gc_lock_depth) & GC_COLLECT_FLAG) == 0);
     MP_STATE_THREAD(gc_lock_depth) |= GC_COLLECT_FLAG;
     MP_STATE_MEM(gc_stack_overflow) = 0;
+    MICROPY_GC_HOOK_COLLECT_START();
 }
 
 void gc_collect_root(void **ptrs, size_t len) {
@@ -603,6 +604,7 @@ void gc_sweep_all(void) {
 
 void gc_collect_end(void) {
     gc_deal_with_stack_overflow();
+    MICROPY_GC_HOOK_MARK_DONE();
     gc_sweep_run_finalisers();
     gc_sweep_free_blocks();
     #if MICROPY_GC_SPLIT_HEAP
@@ -956,17 +958,20 @@ void *gc_alloc(size_t n_bytes, unsigned int alloc_flags) {
             #endif
         }
 
-        GC_EXIT();
         // nothing found!
         if (collected) {
             #if MICROPY_GC_SPLIT_HEAP_AUTO
+            // Still holding the GC lock: adding an area walks and extends the
+            // area list, and the search that follows must hold the lock too.
             if (!added && gc_try_add_heap(n_bytes)) {
                 added = true;
                 continue;
             }
             #endif
+            GC_EXIT();
             return NULL;
         }
+        GC_EXIT();
         DEBUG_printf("gc_alloc(" UINT_FMT "): no free mem, triggering GC\n", n_bytes);
         gc_collect();
         collected = 1;

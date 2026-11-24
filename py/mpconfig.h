@@ -786,6 +786,17 @@ typedef uint64_t mp_uint_t;
 #define MICROPY_GC_HOOK_LOOP(i)
 #endif
 
+// Hooks around the mark phase of a collection, for ports that run Python on
+// several cores without a GIL and must stop the others while marking.
+// COLLECT_START runs with the GC lock held, before any root is marked;
+// MARK_DONE runs once marking is complete, before finalisers and the sweep.
+#ifndef MICROPY_GC_HOOK_COLLECT_START
+#define MICROPY_GC_HOOK_COLLECT_START()
+#endif
+#ifndef MICROPY_GC_HOOK_MARK_DONE
+#define MICROPY_GC_HOOK_MARK_DONE()
+#endif
+
 // Whether to provide m_tracked_calloc, m_tracked_free functions
 #ifndef MICROPY_TRACKED_ALLOC
 #define MICROPY_TRACKED_ALLOC (0)

@@ -38,8 +38,31 @@ typedef struct _mp_thread_mutex_t {
     StaticSemaphore_t buffer;
 } mp_thread_mutex_t;
 
+// Spinning recursive lock (see mpthreadport.c), used for the GC lock when the
+// GIL is off.
+typedef struct _mp_thread_recursive_mutex_t {
+    volatile uint32_t owner; // TaskHandle_t of the holder, 0 = free
+    uint32_t count; // only touched by the owner
+} mp_thread_recursive_mutex_t;
+
 void mp_thread_init(void *stack, uint32_t stack_len);
 void mp_thread_gc_others(void);
 void mp_thread_deinit(void);
+
+#if !MICROPY_PY_THREAD_GIL
+// Stop-the-world GC handshake (see mpthreadport.c). GIL_EXIT/ENTER become
+// "leave/re-enter the heap": EXIT first stores the caller's callee-saved
+// registers (gc_helper_get_regs_and_sp is a leaf, so they are exactly the
+// caller's), and ENTER waits while a collection is marking.
+extern volatile uint32_t mp_thread_gc_stop_req;
+uintptr_t *mp_thread_gc_safe_regs(void);
+uintptr_t gc_helper_get_regs_and_sp(uintptr_t *regs);
+void mp_thread_gc_safe_enter(uintptr_t sp);
+void mp_thread_gc_safe_exit(void);
+void mp_thread_gc_park(void);
+#define MP_THREAD_GIL_EXIT() mp_thread_gc_safe_enter(gc_helper_get_regs_and_sp(mp_thread_gc_safe_regs()))
+#define MP_THREAD_GIL_ENTER() mp_thread_gc_safe_exit()
+#define MP_THREAD_GC_SAFEPOINT() do { if (mp_thread_gc_stop_req) { mp_thread_gc_park(); } } while (0)
+#endif
 
 #endif // MICROPY_INCLUDED_ESP32_MPTHREADPORT_H

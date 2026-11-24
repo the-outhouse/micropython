@@ -288,6 +288,12 @@ typedef struct _mp_state_thread_t {
     // Stack top at the start of program
     char *stack_top;
 
+    #if MICROPY_PY_THREAD && !MICROPY_PY_THREAD_GIL
+    // The port's per-thread state for stopping the world during a GC, or NULL
+    // until the port has registered the thread.
+    void *gc_stop_state;
+    #endif
+
     #if MICROPY_STACK_CHECK
     size_t stack_limit;
     #endif

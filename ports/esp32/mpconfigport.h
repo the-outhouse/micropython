@@ -83,8 +83,26 @@
 #define MICROPY_PY_TIME_TIME_TIME_NS        (1)
 #define MICROPY_PY_TIME_INCLUDEFILE         "ports/esp32/modtime.c"
 #define MICROPY_PY_THREAD                   (1)
+#ifndef MICROPY_PY_THREAD_GIL
 #define MICROPY_PY_THREAD_GIL               (1)
+#endif
 #define MICROPY_PY_THREAD_GIL_VM_DIVISOR    (32)
+#if !MICROPY_PY_THREAD_GIL
+// Without the GIL other threads keep running Python during a collection, so
+// the collector stops them for the mark phase (see mpthreadport.c).
+void mp_thread_gc_pause_others(void);
+void mp_thread_gc_resume_others(void);
+#ifndef MP_THREAD_GC_STOP_STATS_T
+#define MP_THREAD_GC_STOP_STATS_T
+typedef struct {
+    uint32_t n, wait_over_10ms, wait_max_us, stop_max_us;
+    uint64_t wait_sum_us, stop_sum_us;
+} mp_thread_gc_stop_stats_t;
+void mp_thread_gc_stop_stats_read(mp_thread_gc_stop_stats_t *out, bool reset);
+#endif
+#define MICROPY_GC_HOOK_COLLECT_START()     mp_thread_gc_pause_others()
+#define MICROPY_GC_HOOK_MARK_DONE()         mp_thread_gc_resume_others()
+#endif
 
 #define MICROPY_GC_SPLIT_HEAP               (1)
 #define MICROPY_GC_SPLIT_HEAP_AUTO          (1)
