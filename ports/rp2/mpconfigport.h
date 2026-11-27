@@ -35,12 +35,16 @@
 #include "mpconfigboard.h"
 
 // Board and hardware specific configuration
+// mpexec's firmware: the marker ends os.uname().machine and the banner
+// ("Raspberry Pi Pico 2 W with RP2350, mpexec"), so mpexec's caps.py can tell
+// this build from stock on every rp2 board without touching each board file.
+#define MICROPY_HW_MPEXEC_MARKER                ", mpexec"
 #if PICO_RP2040
-#define MICROPY_HW_MCU_NAME                     "RP2040"
+#define MICROPY_HW_MCU_NAME                     "RP2040" MICROPY_HW_MPEXEC_MARKER
 #elif PICO_RP2350 && PICO_ARM
-#define MICROPY_HW_MCU_NAME                     "RP2350"
+#define MICROPY_HW_MCU_NAME                     "RP2350" MICROPY_HW_MPEXEC_MARKER
 #elif PICO_RP2350 && PICO_RISCV
-#define MICROPY_HW_MCU_NAME                     "RP2350-RISCV"
+#define MICROPY_HW_MCU_NAME                     "RP2350-RISCV" MICROPY_HW_MPEXEC_MARKER
 #else
 #error Unknown MCU
 #endif
